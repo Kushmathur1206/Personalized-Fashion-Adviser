@@ -1,4 +1,4 @@
-# Fashion-Recommendation-System
+# Personalized-Fashion-Adviser
 A simple deep learning-based image search engine tailored for emerging fashion brands. This system enables brands to integrate visual similarity search on their own websites by generating and comparing image embeddings from their product catalog.
 Key Features:
 - Lets users upload an image and find visually similar clothing items.
