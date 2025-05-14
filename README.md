@@ -4,15 +4,15 @@ A deep learning-powered image search engine tailored for emerging fashion brands
 - 📸 Upload an image and find visually similar clothing items.
 - 🛍️ Enhance product discovery and user engagement.
 - 🔄 Easily adaptable to any catalog – just embed your product collection.  
-  
 🧰 Tech Stack  
 🖥️ Frontend  
-- 🎨 Streamlit – for a lightweight and interactive web UI
-🧠 Backend  
+- 🎨 Streamlit – for a lightweight and interactive web UI  
+
+🧠 Backend    
 - 🤖 TensorFlow + Keras – for deep learning
 - 🧱 ResNet50 (ImageNet pretrained) – for feature extraction
 - 📏 GlobalMaxPooling2D – to convert feature maps into compact embeddings  
-🔍 Similarity Matching  
+🔍 Similarity Matching    
 - 🧮 scikit-learn’s NearestNeighbors – with Euclidean distance for image similarity
 
 DATASET LINK - https://www.kaggle.com/datasets/paramaggarwal/fashion-product-images-dataset
