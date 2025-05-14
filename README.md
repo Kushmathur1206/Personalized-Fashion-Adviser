@@ -7,7 +7,7 @@ A deep learning-powered image search engine tailored for emerging fashion brands
   
 🧰 Tech Stack  
 🖥️ Frontend  
-  🎨 Streamlit – for a lightweight and interactive web UI  
+    🎨 Streamlit – for a lightweight and interactive web UI  
 🧠 Backend  
   🤖 TensorFlow + Keras – for deep learning  
   🧱 ResNet50 (ImageNet pretrained) – for feature extraction  
