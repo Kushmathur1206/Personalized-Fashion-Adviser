@@ -1,9 +1,8 @@
 # 👗✨ Personalized Fashion Adviser
 A deep learning-powered image search engine tailored for emerging fashion brands. This system enables brands to integrate visual similarity search on their own websites by generating and comparing image embeddings from their product catalogs.
-🚀 Key Features
-  📸 Upload an image and find visually similar clothing items.
-  🛍️ Enhance product discovery and user engagement.
-
+🚀 Key Features  
+  📸 Upload an image and find visually similar clothing items.  
+  🛍️ Enhance product discovery and user engagement.  
   🔄 Easily adaptable to any catalog – just embed your product collection.
 
 🧰 Tech Stack
