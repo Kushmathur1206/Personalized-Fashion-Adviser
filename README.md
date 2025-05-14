@@ -11,7 +11,7 @@ A deep learning-powered image search engine tailored for emerging fashion brands
 🧠 Backend  
 - 🤖 TensorFlow + Keras – for deep learning
 - 🧱 ResNet50 (ImageNet pretrained) – for feature extraction
-- 📏 GlobalMaxPooling2D – to convert feature maps into compact embeddings
+- 📏 GlobalMaxPooling2D – to convert feature maps into compact embeddings  
 🔍 Similarity Matching  
 - 🧮 scikit-learn’s NearestNeighbors – with Euclidean distance for image similarity
 
