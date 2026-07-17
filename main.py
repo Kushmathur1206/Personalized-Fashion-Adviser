@@ -1,13 +1,13 @@
 """
-Personalized Fashion Adviser - Streamlit Application.
+Personalized Fashion Adviser — Outfit Builder.
 
-Enhanced with deep learning:
-- Multi-modal recommendations (visual + style + LSTM sequence prediction)
-- Fashion category & attribute classification
-- Diversity-aware results (MMR re-ranking)
-- Complementary item suggestions
-- Interactive filtering by category, style, season, color
-- User session tracking for LSTM-based preference learning
+Upload a clothing item, pick an occasion, get a complete styled outfit.
+
+Models used:
+- ResNet50 + projection head: extracts style-aware embeddings
+- LSTM-VAE: refines embeddings for better similarity matching
+- Outfit rules: decides which slots to fill
+- Cosine similarity: ranks items per slot by style match
 """
 
 import os
@@ -16,390 +16,222 @@ import pickle
 import numpy as np
 import streamlit as st
 from PIL import Image
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+from tensorflow.keras.layers import GlobalAveragePooling2D
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.preprocessing import image as keras_image
 from numpy.linalg import norm
 
-from models.feature_extractor import FashionFeatureExtractor
-from models.fashion_classifier import FashionClassifier
-from models.style_encoder import StyleEncoder
-from models.autoencoder import FashionAutoencoder
-from recommendation.engine import RecommendationEngine, SequencePredictor
-from recommendation.diversity import DiversityReranker
-from recommendation.filters import AttributeFilter
-
-
-# ─────────────────────────────────────────────────────────────
-# Page Configuration
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Fashion Adviser - AI Powered",
-    page_icon="👗",
-    layout="wide"
+from outfit_builder import (
+    build_outfit, classify_upload, OCCASIONS, CATEGORY_MAP
 )
-
-st.title("👗 Personalized Fashion Adviser")
-st.markdown(
-    "**Deep Learning Powered** — Visual similarity, style matching, "
-    "LSTM sequence prediction, and diversity-aware recommendations"
-)
+from lstm_outfit import OutfitLSTM, generate_outfit_lstm
 
 
 # ─────────────────────────────────────────────────────────────
-# Load Data & Models (cached for performance)
+# Config
 # ─────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_embeddings():
-    """Load all precomputed embeddings and metadata."""
-    data = {}
 
-    # Visual embeddings (required)
-    data['visual'] = np.array(pickle.load(open('embeddings.pkl', 'rb')))
-    data['filenames'] = pickle.load(open('filenames.pkl', 'rb'))
+st.set_page_config(page_title="Fashion Outfit Builder", page_icon="👗", layout="wide")
 
-    # Style embeddings (optional)
-    if os.path.exists('style_embeddings.pkl'):
-        data['style'] = np.array(pickle.load(open('style_embeddings.pkl', 'rb')))
-    else:
-        data['style'] = None
+SLOT_ICONS = {
+    'top': '👕',
+    'bottom': '👖',
+    'shoes': '�',
+    'outerwear': '🧥',
+    'accessory': '🧢',
+    'dress': '👗',
+}
 
-    # Refined embeddings (optional)
-    if os.path.exists('refined_embeddings.pkl'):
-        data['refined'] = np.array(pickle.load(open('refined_embeddings.pkl', 'rb')))
-    else:
-        data['refined'] = None
+SLOT_NAMES = {
+    'top': 'Top',
+    'bottom': 'Bottom',
+    'shoes': 'Shoes',
+    'outerwear': 'Outerwear',
+    'accessory': 'Accessory',
+    'dress': 'Dress',
+}
 
-    # Metadata (optional)
-    if os.path.exists('metadata.pkl'):
-        data['metadata'] = pickle.load(open('metadata.pkl', 'rb'))
-    else:
-        data['metadata'] = None
 
-    # Categories (optional)
-    if os.path.exists('categories.pkl'):
-        data['categories'] = pickle.load(open('categories.pkl', 'rb'))
-    else:
-        data['categories'] = None
-
-    return data
-
+# ─────────────────────────────────────────────────────────────
+# Load Data
+# ─────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def load_models():
-    """Initialize deep learning models."""
-    models = {}
-
-    # Feature extractor (ResNet50 for fast inference in app)
-    models['extractor'] = FashionFeatureExtractor(
-        embedding_dim=512, backbone='resnet50', fine_tune_layers=0
-    )
-
-    # Fashion classifier
-    models['classifier'] = FashionClassifier()
-
-    # Style encoder
-    models['style_encoder'] = StyleEncoder(embedding_dim=256)
-
-    return models
+def load_model():
+    """Load feature extraction model (ResNet50 + pooling)."""
+    base = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    base.trainable = False
+    model = Sequential([
+        base,
+        GlobalAveragePooling2D(),
+    ])
+    return model
 
 
-@st.cache_resource
-def build_recommendation_engine(_data):
-    """Build the multi-modal recommendation engine."""
-    engine = RecommendationEngine(
-        visual_weight=0.35,
-        style_weight=0.25,
-        category_weight=0.15,
-        sequence_weight=0.25,
-        n_neighbors=20,
-        metric='cosine'
-    )
-
-    engine.build_index(
-        visual_features=_data['visual'],
-        style_features=_data['style'],
-        refined_features=_data['refined'],
-        categories=_data['categories'],
-        filenames=_data['filenames']
-    )
-
-    return engine
+@st.cache_data
+def load_catalog():
+    """Load precomputed embeddings, labels, and filenames."""
+    embeddings = np.array(pickle.load(open('embeddings.pkl', 'rb')))
+    filenames = pickle.load(open('filenames.pkl', 'rb'))
+    labels = pickle.load(open('labels.pkl', 'rb'))
+    return embeddings, filenames, labels
 
 
-# Load everything
-data = load_embeddings()
-models = load_models()
-engine = build_recommendation_engine(data)
-reranker = DiversityReranker(lambda_param=0.6)
-attr_filter = AttributeFilter()
+def extract_embedding(img_path, model):
+    """Extract normalized embedding from an image."""
+    img = keras_image.load_img(img_path, target_size=(224, 224))
+    img_array = keras_image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    img_array = preprocess_input(img_array)
+    features = model.predict(img_array, verbose=0).flatten()
+    return features / (norm(features) + 1e-7)
 
-# Set up attribute filter with metadata
-if data['metadata'] is not None:
-    attr_filter.set_metadata(data['metadata'])
 
-# Initialize session state for interaction history (LSTM)
-if 'interaction_history' not in st.session_state:
-    st.session_state.interaction_history = []
+def predict_category(embedding, catalog_embeddings, catalog_labels):
+    """
+    Predict category of uploaded item by finding nearest neighbors
+    and taking majority vote. Simple but effective.
+    """
+    # Cosine similarity to all catalog items
+    sims = catalog_embeddings @ embedding
+    top_k = np.argsort(sims)[-10:]  # top 10 most similar
+    top_labels = [catalog_labels[i] for i in top_k]
+
+    # Majority vote
+    from collections import Counter
+    votes = Counter(top_labels)
+    return votes.most_common(1)[0][0]
 
 
 # ─────────────────────────────────────────────────────────────
-# Helper Functions
+# UI
 # ─────────────────────────────────────────────────────────────
-def save_uploaded_file(uploaded_file):
-    """Save uploaded image to disk."""
-    try:
-        os.makedirs('uploads', exist_ok=True)
-        filepath = os.path.join('uploads', uploaded_file.name)
-        with open(filepath, 'wb') as f:
-            f.write(uploaded_file.getbuffer())
-        return filepath
-    except Exception as e:
-        st.error(f"Error saving file: {e}")
-        return None
 
+st.title("👗 Outfit Builder")
+st.markdown("Upload a clothing item → pick an occasion → get a complete outfit")
 
-def extract_all_features(img_path):
-    """Extract visual, style, and classification features for a query image."""
-    # Visual embedding
-    visual_features = models['extractor'].extract_features(img_path)
-
-    # Style embedding
-    style_features = models['style_encoder'].encode_style(img_path)
-
-    # Classification
-    classification = models['classifier'].predict(img_path)
-
-    return visual_features, style_features, classification
-
-
-def display_classification(classification):
-    """Display the AI classification results."""
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Category",
-            classification['category'],
-            f"{classification['category_confidence']:.0%} confidence"
-        )
-
-    with col2:
-        st.metric("Style", ", ".join(classification['styles']))
-
-    with col3:
-        st.metric("Season", ", ".join(classification['seasons']))
-
-    with col4:
-        st.metric("Colors", ", ".join(classification['colors'][:3]))
-
-
-def display_recommendations(indices, title="Recommended Items", cols=6):
-    """Display recommendation grid."""
-    if not indices:
-        st.info("No matching items found.")
-        return
-
-    st.subheader(title)
-    columns = st.columns(min(cols, len(indices)))
-
-    for i, idx in enumerate(indices[:cols]):
-        with columns[i % cols]:
-            if idx < len(data['filenames']):
-                filepath = data['filenames'][idx]
-                if os.path.exists(filepath):
-                    st.image(filepath, use_container_width=True)
-                    # Show category if available
-                    if data['metadata'] is not None and idx < len(data['metadata']):
-                        meta = data['metadata'][idx]
-                        st.caption(f"{meta['category']} | {', '.join(meta['styles'][:2])}")
-                else:
-                    st.warning(f"Image not found")
-
-
-# ─────────────────────────────────────────────────────────────
-# Sidebar Controls
-# ─────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Recommendation Settings")
-
-# Mode selection
-rec_mode = st.sidebar.radio(
-    "Recommendation Mode",
-    ["Smart (Multi-modal)", "Visual Only", "Style Match", "Complementary Items"],
-    help="Smart combines all signals. Visual uses appearance only. "
-         "Style Match finds similar style regardless of look. "
-         "Complementary suggests items that pair well."
+# Sidebar
+st.sidebar.header("Occasion")
+occasion = st.sidebar.radio(
+    "What's the occasion?",
+    list(OCCASIONS.keys()),
+    index=0,
 )
+n_options = st.sidebar.slider("Options per slot", 2, 5, 3)
 
-# Number of results
-n_results = st.sidebar.slider("Number of Results", 4, 12, 6)
-
-# Diversity control
-diversity = st.sidebar.slider(
-    "Diversity Level",
-    0.0, 1.0, 0.6,
-    help="Higher = more varied results, Lower = more similar results"
-)
-reranker.lambda_param = 1.0 - diversity  # Invert for UX clarity
-
-# Filters
-st.sidebar.header("🔍 Filters")
-filter_category = st.sidebar.selectbox(
-    "Category Filter",
-    ["None"] + [
-        'Topwear', 'Bottomwear', 'Shoes', 'Bags', 'Accessories',
-        'Dress', 'Sandals', 'Watches', 'Saree', 'Jewellery'
-    ]
-)
-filter_style = st.sidebar.multiselect(
-    "Style Filter",
-    ['Casual', 'Formal', 'Sports', 'Ethnic', 'Party',
-     'Smart Casual', 'Travel', 'Streetwear']
-)
-filter_season = st.sidebar.multiselect(
-    "Season Filter",
-    ['Spring', 'Summer', 'Autumn', 'Winter', 'All-Season']
-)
-
-
-# ─────────────────────────────────────────────────────────────
-# Main Upload & Recommendation Flow
-# ─────────────────────────────────────────────────────────────
+# Upload
 uploaded_file = st.file_uploader(
-    "Upload a fashion image to get personalized recommendations",
-    type=['jpg', 'jpeg', 'png', 'webp', 'bmp']
+    "Upload a clothing image", type=['jpg', 'jpeg', 'png', 'webp']
 )
 
 if uploaded_file is not None:
-    filepath = save_uploaded_file(uploaded_file)
+    # Save file
+    os.makedirs('uploads', exist_ok=True)
+    filepath = os.path.join('uploads', uploaded_file.name)
+    with open(filepath, 'wb') as f:
+        f.write(uploaded_file.getbuffer())
 
-    if filepath:
-        # Display uploaded image
-        col_img, col_info = st.columns([1, 2])
+    # Load resources
+    model = load_model()
+    catalog_embeddings, catalog_filenames, catalog_labels = load_catalog()
 
-        with col_img:
-            st.image(Image.open(uploaded_file), caption="Your Upload", width=300)
-
-        with col_info:
-            with st.spinner("🧠 Analyzing with deep learning models..."):
-                visual_features, style_features, classification = \
-                    extract_all_features(filepath)
-
-            st.subheader("🤖 AI Analysis")
-            display_classification(classification)
-
-            # Add to interaction history for LSTM
-            st.session_state.interaction_history.append(visual_features)
-            # Keep last 20 interactions
-            if len(st.session_state.interaction_history) > 20:
-                st.session_state.interaction_history = \
-                    st.session_state.interaction_history[-20:]
-
-        st.divider()
-
-        # Generate recommendations based on selected mode
-        with st.spinner("Finding the best matches..."):
-
-            if rec_mode == "Smart (Multi-modal)":
-                # Full multi-modal recommendation with LSTM sequence awareness
-                results = engine.recommend(
-                    query_visual=visual_features,
-                    query_style=style_features,
-                    query_category=classification['category'],
-                    interaction_history=(
-                        st.session_state.interaction_history
-                        if len(st.session_state.interaction_history) > 1
-                        else None
-                    ),
-                    sequence_predictor=None,  # Use trained predictor if available
-                    n_results=n_results * 3,  # Get extra for filtering/reranking
-                    category_filter=(
-                        filter_category if filter_category != "None" else None
-                    )
-                )
-                candidate_indices = results['indices']
-                candidate_scores = results['scores']
-
-            elif rec_mode == "Visual Only":
-                candidate_indices = list(
-                    engine.recommend_simple(visual_features, n_results=n_results * 3)
-                )
-                candidate_scores = [1.0 / (i + 1) for i in range(len(candidate_indices))]
-
-            elif rec_mode == "Style Match":
-                candidate_indices = list(
-                    engine.get_similar_by_style(style_features, n_results=n_results * 3)
-                )
-                candidate_scores = [1.0 / (i + 1) for i in range(len(candidate_indices))]
-
-            elif rec_mode == "Complementary Items":
-                candidate_indices = engine.get_complementary(
-                    classification['category'], style_features, n_results=n_results * 3
-                )
-                candidate_scores = [1.0 / (i + 1) for i in range(len(candidate_indices))]
-
-            # Apply attribute filters
-            if filter_style:
-                candidate_indices = attr_filter.filter_by_style(
-                    candidate_indices, filter_style
-                )
-            if filter_season:
-                candidate_indices = attr_filter.filter_by_season(
-                    candidate_indices, filter_season
-                )
-
-            # Apply diversity re-ranking
-            if len(candidate_indices) > n_results and len(candidate_scores) >= len(candidate_indices):
-                scores_for_rerank = candidate_scores[:len(candidate_indices)]
-                final_indices = reranker.rerank(
-                    candidate_indices,
-                    scores_for_rerank,
-                    data['visual'],
-                    n_results=n_results
-                )
-            else:
-                final_indices = candidate_indices[:n_results]
-
-        # Display results
-        display_recommendations(final_indices, "✨ Recommended Items", cols=n_results)
-
-        # Show complementary items if in Smart mode
-        if rec_mode == "Smart (Multi-modal)":
-            st.divider()
-            complementary = engine.get_complementary(
-                classification['category'], style_features, n_results=4
-            )
-            if complementary:
-                display_recommendations(
-                    complementary,
-                    "🎯 Complete the Look (Complementary Items)",
-                    cols=4
-                )
-
-        # Show diversity score
-        if final_indices:
-            div_score = reranker.compute_diversity_score(
-                final_indices, data['visual']
-            )
-            st.sidebar.metric("Recommendation Diversity", f"{div_score:.2f}")
-
-        # Session info
-        st.sidebar.divider()
-        st.sidebar.caption(
-            f"📊 Session: {len(st.session_state.interaction_history)} interactions tracked"
+    # Extract embedding
+    with st.spinner("Analyzing your item..."):
+        query_embedding = extract_embedding(filepath, model)
+        predicted_label = predict_category(
+            query_embedding, catalog_embeddings, catalog_labels
         )
-        if st.sidebar.button("Clear History"):
-            st.session_state.interaction_history = []
-            st.rerun()
 
+    # Show uploaded item
+    uploaded_group = classify_upload(predicted_label)
+
+    col_upload, col_info = st.columns([1, 2])
+    with col_upload:
+        st.image(Image.open(uploaded_file), width=250)
+    with col_info:
+        st.markdown(f"**Detected:** {predicted_label}")
+        st.markdown(f"**Category:** {SLOT_NAMES.get(uploaded_group, uploaded_group)}")
+        st.markdown(f"**Occasion:** {occasion}")
+
+    st.divider()
+
+    # Build outfit
+    with st.spinner("Building your outfit..."):
+        outfit = build_outfit(
+            query_embedding=query_embedding,
+            uploaded_label=predicted_label,
+            occasion=occasion,
+            catalog_embeddings=catalog_embeddings,
+            catalog_labels=catalog_labels,
+            catalog_filenames=catalog_filenames,
+            n_options=n_options,
+        )
+
+    if not outfit:
+        st.warning("Couldn't build an outfit — not enough items in catalog for this combination.")
     else:
-        st.error("Failed to save the uploaded file. Please try again.")
+        st.subheader("Your Outfit (Rule-based + Style Matching)")
 
+        for slot, options in outfit.items():
+            icon = SLOT_ICONS.get(slot, '🔹')
+            name = SLOT_NAMES.get(slot, slot.title())
+            st.markdown(f"### {icon} {name}")
 
-# ─────────────────────────────────────────────────────────────
-# Footer
-# ─────────────────────────────────────────────────────────────
-st.divider()
-st.markdown("""
-<div style='text-align: center; color: grey; font-size: 0.8em;'>
-    <p>Powered by ResNet50 + LSTM + Triplet Loss + Variational Autoencoder</p>
-    <p>Multi-modal recommendations with diversity-aware re-ranking</p>
-</div>
-""", unsafe_allow_html=True)
+            cols = st.columns(len(options))
+            for i, item in enumerate(options):
+                with cols[i]:
+                    if os.path.exists(item['filename']):
+                        st.image(item['filename'], use_container_width=True)
+                        st.caption(f"{item['label']} • {item['score']:.0%} match")
+                    else:
+                        st.error("Image not found")
+
+    # ─────────────────────────────────────────────────────────
+    # LSTM Row
+    # ─────────────────────────────────────────────────────────
+    st.divider()
+
+    lstm_path = 'saved_models/outfit_lstm.weights.h5'
+    if os.path.exists(lstm_path):
+        st.subheader("🧠 LSTM Suggestion (Sequential Prediction)")
+        st.caption(
+            "Each item is predicted based on ALL previous items — "
+            "the shoes know what pants were picked."
+        )
+
+        lstm_model = OutfitLSTM()
+        lstm_model.load(lstm_path)
+
+        with st.spinner("LSTM generating outfit..."):
+            lstm_results = generate_outfit_lstm(
+                lstm_model=lstm_model,
+                query_embedding=query_embedding,
+                query_label=predicted_label,
+                occasion=occasion,
+                catalog_embeddings=catalog_embeddings,
+                catalog_labels=catalog_labels,
+                catalog_filenames=catalog_filenames,
+                max_items=3,
+            )
+
+        if lstm_results:
+            cols = st.columns(len(lstm_results))
+            for i, item in enumerate(lstm_results):
+                with cols[i]:
+                    if os.path.exists(item['filename']):
+                        st.image(item['filename'], use_container_width=True)
+                        slot_icon = SLOT_ICONS.get(item['slot'], '🔹')
+                        st.caption(
+                            f"{slot_icon} {item['label']} • "
+                            f"{item['score']:.0%} • Step {i+1}"
+                        )
+                    else:
+                        st.error("Image not found")
+        else:
+            st.info("LSTM couldn't generate suggestions for this combination.")
+    else:
+        st.info("🧠 LSTM model not found. Run `python app.py` to train it.")
+
+    st.divider()
+    st.info("💡 Try switching the occasion — both rule-based and LSTM results will change.")

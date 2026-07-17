@@ -1,316 +1,171 @@
 """
-Embedding Generation Pipeline.
+Embedding Pipeline — generates embeddings + labels for the catalog.
 
-Processes all images in the catalog and generates:
-1. Visual embeddings (ResNet50 feature extractor)
-2. Style embeddings (triplet-loss style encoder)
-3. Refined embeddings (LSTM-VAE autoencoder)
-4. Category/attribute metadata (fashion classifier)
-
-All outputs are saved as pickle files for use by the recommendation engine.
+Reads images and their labels from the clothing-dataset,
+extracts ResNet50 embeddings, and saves:
+- embeddings.pkl (normalized feature vectors)
+- filenames.pkl (image paths)
+- labels.pkl (category label per image)
 
 Usage:
-    python app.py --images_dir images --backbone resnet50
-    python app.py --images_dir images --backbone dual --batch_size 16
+    python app.py --images_dir clothing-dataset/images --labels_csv clothing-dataset/images.csv
+    python app.py --images_dir clothing-dataset/images --labels_csv clothing-dataset/images.csv --max_images 300
 """
 
 import os
+import csv
 import argparse
 import pickle
 
 import numpy as np
-from tqdm import tqdm
-
-from models.feature_extractor import FashionFeatureExtractor
-from models.fashion_classifier import FashionClassifier
-from models.style_encoder import StyleEncoder
-from models.autoencoder import FashionAutoencoder
+from tensorflow.keras.applications.resnet50 import ResNet50, preprocess_input
+from tensorflow.keras.layers import GlobalAveragePooling2D
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.preprocessing import image as keras_image
+from numpy.linalg import norm
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Generate fashion embeddings for the product catalog'
-    )
-    parser.add_argument(
-        '--images_dir', type=str, default='images',
-        help='Directory containing product images'
-    )
-    parser.add_argument(
-        '--output_dir', type=str, default='.',
-        help='Directory to save embedding pickle files'
-    )
-    parser.add_argument(
-        '--backbone', type=str, default='resnet50',
-        choices=['resnet50', 'efficientnet', 'dual'],
-        help='Feature extractor backbone architecture'
-    )
-    parser.add_argument(
-        '--embedding_dim', type=int, default=512,
-        help='Dimension of visual embeddings'
-    )
-    parser.add_argument(
-        '--style_dim', type=int, default=256,
-        help='Dimension of style embeddings'
-    )
-    parser.add_argument(
-        '--latent_dim', type=int, default=128,
-        help='Dimension of VAE-refined embeddings'
-    )
-    parser.add_argument(
-        '--batch_size', type=int, default=32,
-        help='Batch size for processing images'
-    )
-    parser.add_argument(
-        '--train_vae', action='store_true',
-        help='Train the LSTM-VAE on extracted embeddings'
-    )
-    parser.add_argument(
-        '--vae_epochs', type=int, default=50,
-        help='Number of epochs for VAE training'
-    )
-    parser.add_argument(
-        '--skip_style', action='store_true',
-        help='Skip style embedding extraction'
-    )
-    parser.add_argument(
-        '--skip_classifier', action='store_true',
-        help='Skip category/attribute classification'
-    )
-    parser.add_argument(
-        '--max_images', type=int, default=None,
-        help='Limit number of images to process (for quick testing on CPU)'
-    )
+    parser = argparse.ArgumentParser(description='Generate catalog embeddings')
+    parser.add_argument('--images_dir', type=str, default='clothing-dataset/images')
+    parser.add_argument('--labels_csv', type=str, default='clothing-dataset/images.csv')
+    parser.add_argument('--max_images', type=int, default=None,
+                        help='Limit images to process (for fast testing on CPU)')
+    parser.add_argument('--batch_size', type=int, default=32)
     return parser.parse_args()
 
 
-def get_image_files(images_dir):
-    """Collect all valid image files from the directory."""
-    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-    filenames = []
-
-    for file in sorted(os.listdir(images_dir)):
-        ext = os.path.splitext(file)[1].lower()
-        if ext in valid_extensions:
-            filenames.append(os.path.join(images_dir, file))
-
-    print(f"Found {len(filenames)} images in '{images_dir}'")
-    return filenames
-
-
-def extract_visual_embeddings(filenames, backbone, embedding_dim, batch_size):
-    """Extract visual feature embeddings using the enhanced feature extractor."""
-    print("\n" + "=" * 60)
-    print("STEP 1: Extracting Visual Embeddings")
-    print(f"  Backbone: {backbone}")
-    print(f"  Embedding dim: {embedding_dim}")
-    print("=" * 60)
-
-    extractor = FashionFeatureExtractor(
-        embedding_dim=embedding_dim,
-        backbone=backbone,
-        fine_tune_layers=20
-    )
-
-    print("Processing images in batches...")
-    features = extractor.extract_features_batch(filenames, batch_size=batch_size)
-    print(f"Visual embeddings shape: {features.shape}")
-
-    return features, extractor
+def load_labels(csv_path):
+    """Load image_id -> label mapping from CSV."""
+    labels = {}
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            label = row['label']
+            if label in ('Not sure', 'Skip', 'Other'):
+                continue
+            labels[row['image']] = label
+    return labels
 
 
-def extract_style_embeddings(filenames, style_dim, batch_size):
-    """Extract style-aware embeddings using the triplet-loss encoder."""
-    print("\n" + "=" * 60)
-    print("STEP 2: Extracting Style Embeddings")
-    print(f"  Style dim: {style_dim}")
-    print("=" * 60)
-
-    style_encoder = StyleEncoder(embedding_dim=style_dim)
-
-    print("Processing style embeddings...")
-    style_features = style_encoder.encode_style_batch(
-        filenames, batch_size=batch_size
-    )
-    print(f"Style embeddings shape: {style_features.shape}")
-
-    return style_features, style_encoder
+def build_model():
+    """ResNet50 + GlobalAveragePooling = 2048-d embedding."""
+    base = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    base.trainable = False
+    model = Sequential([base, GlobalAveragePooling2D()])
+    return model
 
 
-def classify_attributes(filenames, batch_size):
-    """Run multi-task classification for category and attributes."""
-    print("\n" + "=" * 60)
-    print("STEP 3: Classifying Fashion Attributes")
-    print("  Predicting: category, style, season, color")
-    print("=" * 60)
+def extract_batch(paths, model, batch_size=32):
+    """Extract normalized embeddings in batches."""
+    all_features = []
 
-    classifier = FashionClassifier()
+    for i in range(0, len(paths), batch_size):
+        batch_paths = paths[i:i + batch_size]
+        batch_images = []
 
-    print("Classifying images...")
-    metadata = classifier.predict_batch(filenames, batch_size=batch_size)
-    print(f"Classified {len(metadata)} items")
+        for p in batch_paths:
+            try:
+                img = keras_image.load_img(p, target_size=(224, 224))
+                batch_images.append(keras_image.img_to_array(img))
+            except Exception as e:
+                print(f"  Skipping {p}: {e}")
+                batch_images.append(np.zeros((224, 224, 3)))
 
-    # Summary statistics
-    categories = [m['category'] for m in metadata]
-    unique_cats = set(categories)
-    print(f"  Categories found: {len(unique_cats)}")
-    for cat in sorted(unique_cats):
-        count = categories.count(cat)
-        print(f"    {cat}: {count} items")
+        batch_array = preprocess_input(np.array(batch_images))
+        features = model.predict(batch_array, verbose=0)
 
-    return metadata, classifier
+        # Normalize each vector
+        norms = np.linalg.norm(features, axis=1, keepdims=True) + 1e-7
+        all_features.append(features / norms)
 
+        done = min(i + batch_size, len(paths))
+        print(f"  Processed {done}/{len(paths)} images", end='\r')
 
-def refine_with_vae(visual_features, latent_dim, train_vae, vae_epochs):
-    """Refine embeddings using the LSTM-VAE."""
-    print("\n" + "=" * 60)
-    print("STEP 4: Refining Embeddings with LSTM-VAE")
-    print(f"  Input dim: {visual_features.shape[1]}")
-    print(f"  Latent dim: {latent_dim}")
-    print("=" * 60)
-
-    input_dim = visual_features.shape[1]
-    # seq_length must divide input_dim evenly
-    seq_length = 32
-    while input_dim % seq_length != 0:
-        seq_length -= 1
-
-    autoencoder = FashionAutoencoder(
-        input_dim=input_dim,
-        latent_dim=latent_dim,
-        seq_length=seq_length,
-        beta=1.0
-    )
-
-    if train_vae:
-        print(f"Training LSTM-VAE for {vae_epochs} epochs...")
-        autoencoder.compile_model(learning_rate=1e-3)
-        history = autoencoder.train(
-            visual_features,
-            epochs=vae_epochs,
-            batch_size=64,
-            validation_split=0.1
-        )
-        final_loss = history.history['loss'][-1]
-        print(f"  Final training loss: {final_loss:.4f}")
-
-        # Save trained VAE
-        os.makedirs('saved_models', exist_ok=True)
-        autoencoder.save_model('saved_models/autoencoder')
-        print("  LSTM-VAE model saved to saved_models/")
-    else:
-        print("Skipping VAE training (use --train_vae to enable)")
-        print("Using untrained VAE for dimensionality reduction...")
-
-    # Generate refined embeddings
-    refined_features = autoencoder.refine_embeddings_batch(visual_features)
-    print(f"Refined embeddings shape: {refined_features.shape}")
-
-    return refined_features, autoencoder
-
-
-def save_outputs(output_dir, filenames, visual_features, style_features,
-                 refined_features, metadata):
-    """Save all generated data as pickle files."""
-    print("\n" + "=" * 60)
-    print("SAVING OUTPUTS")
-    print("=" * 60)
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Visual embeddings (backward compatible with original format)
-    embeddings_path = os.path.join(output_dir, 'embeddings.pkl')
-    pickle.dump(list(visual_features), open(embeddings_path, 'wb'))
-    print(f"  Visual embeddings -> {embeddings_path}")
-
-    # Filenames
-    filenames_path = os.path.join(output_dir, 'filenames.pkl')
-    pickle.dump(filenames, open(filenames_path, 'wb'))
-    print(f"  Filenames -> {filenames_path}")
-
-    # Style embeddings
-    if style_features is not None:
-        style_path = os.path.join(output_dir, 'style_embeddings.pkl')
-        pickle.dump(list(style_features), open(style_path, 'wb'))
-        print(f"  Style embeddings -> {style_path}")
-
-    # Refined (VAE) embeddings
-    if refined_features is not None:
-        refined_path = os.path.join(output_dir, 'refined_embeddings.pkl')
-        pickle.dump(list(refined_features), open(refined_path, 'wb'))
-        print(f"  Refined embeddings -> {refined_path}")
-
-    # Item metadata (categories, styles, seasons, colors)
-    if metadata is not None:
-        metadata_path = os.path.join(output_dir, 'metadata.pkl')
-        pickle.dump(metadata, open(metadata_path, 'wb'))
-        print(f"  Item metadata -> {metadata_path}")
-
-        # Also save categories as a simple list for backward compatibility
-        categories = [m['category'] for m in metadata]
-        categories_path = os.path.join(output_dir, 'categories.pkl')
-        pickle.dump(categories, open(categories_path, 'wb'))
-        print(f"  Categories -> {categories_path}")
-
-    print(f"\n  Total items processed: {len(filenames)}")
-    print("  All outputs saved successfully!")
+    print()
+    return np.vstack(all_features)
 
 
 def main():
     args = parse_args()
 
-    # Validate input directory
-    if not os.path.isdir(args.images_dir):
-        print(f"Error: Images directory '{args.images_dir}' not found.")
-        print("Please ensure your product images are in the specified directory.")
-        return
+    # Load labels
+    print("Loading labels...")
+    label_map = load_labels(args.labels_csv)
+    print(f"  {len(label_map)} labeled images (excluded 'Not sure', 'Skip', 'Other')")
 
-    # Create uploads directory if it doesn't exist
-    os.makedirs('uploads', exist_ok=True)
+    # Collect valid image files that have labels
+    filenames = []
+    labels = []
 
-    # Collect image files
-    filenames = get_image_files(args.images_dir)
+    for image_id, label in label_map.items():
+        # Dataset uses UUID filenames with .jpg extension
+        path = os.path.join(args.images_dir, f"{image_id}.jpg")
+        if os.path.exists(path):
+            filenames.append(path)
+            labels.append(label)
+
+    print(f"  {len(filenames)} images found on disk")
+
     if not filenames:
-        print("No valid image files found. Supported formats: jpg, jpeg, png, bmp, webp")
+        print("Error: No images found. Check --images_dir and --labels_csv paths.")
         return
 
-    # Limit number of images if specified (useful for CPU testing)
+    # Limit if requested
     if args.max_images and args.max_images < len(filenames):
         filenames = filenames[:args.max_images]
-        print(f"Limited to {args.max_images} images (use --max_images to adjust)")
+        labels = labels[:args.max_images]
+        print(f"  Limited to {args.max_images} images")
 
-    # Step 1: Visual embeddings
-    visual_features, _ = extract_visual_embeddings(
-        filenames, args.backbone, args.embedding_dim, args.batch_size
-    )
+    # Extract embeddings
+    print("\nBuilding model...")
+    model = build_model()
 
-    # Step 2: Style embeddings
-    style_features = None
-    if not args.skip_style:
-        style_features, _ = extract_style_embeddings(
-            filenames, args.style_dim, args.batch_size
-        )
+    print(f"\nExtracting embeddings ({len(filenames)} images)...")
+    embeddings = extract_batch(filenames, model, batch_size=args.batch_size)
+    print(f"  Embeddings shape: {embeddings.shape}")
 
-    # Step 3: Category/attribute classification
-    metadata = None
-    if not args.skip_classifier:
-        metadata, _ = classify_attributes(filenames, args.batch_size)
+    # Save
+    print("\nSaving...")
+    pickle.dump(list(embeddings), open('embeddings.pkl', 'wb'))
+    pickle.dump(filenames, open('filenames.pkl', 'wb'))
+    pickle.dump(labels, open('labels.pkl', 'wb'))
 
-    # Step 4: LSTM-VAE refinement
-    refined_features, _ = refine_with_vae(
-        visual_features, args.latent_dim, args.train_vae, args.vae_epochs
-    )
+    print(f"\n  embeddings.pkl  ({embeddings.shape[0]} x {embeddings.shape[1]})")
+    print(f"  filenames.pkl   ({len(filenames)} paths)")
+    print(f"  labels.pkl      ({len(labels)} labels)")
 
-    # Save everything
-    save_outputs(
-        args.output_dir, filenames, visual_features,
-        style_features, refined_features, metadata
-    )
+    # Print label distribution
+    from collections import Counter
+    dist = Counter(labels)
+    print(f"\n  Label distribution:")
+    for label, count in dist.most_common():
+        print(f"    {label}: {count}")
 
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE")
-    print("=" * 60)
-    print(f"Generated embeddings for {len(filenames)} products")
-    print(f"Run 'streamlit run main.py' to start the recommendation app")
+    # Train LSTM outfit model
+    print("\n" + "=" * 50)
+    print("Training LSTM Outfit Sequence Model...")
+    print("=" * 50)
+
+    from lstm_outfit import OutfitLSTM, generate_training_sequences
+
+    # Generate synthetic outfit sequences from catalog
+    print("  Generating training sequences...")
+    X_train, Y_train = generate_training_sequences(embeddings, labels, n_sequences=3000)
+    print(f"  Training data: {X_train.shape[0]} samples")
+
+    # Train
+    lstm_model = OutfitLSTM()
+    lstm_model.compile(lr=1e-3)
+    print("  Training LSTM...")
+    lstm_model.train(X_train, Y_train, epochs=20, batch_size=64)
+
+    # Save
+    os.makedirs('saved_models', exist_ok=True)
+    lstm_model.save('saved_models/outfit_lstm.weights.h5')
+    print("  LSTM model saved to saved_models/outfit_lstm.weights.h5")
+
+    print("\nDone. Run: streamlit run main.py")
 
 
 if __name__ == '__main__':
