@@ -1,0 +1,7 @@
+tensorflow>=2.12.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+streamlit>=1.28.0
+Pillow>=9.5.0
+tqdm>=4.65.0
+opencv-python>=4.7.0
